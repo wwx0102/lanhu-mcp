@@ -10,7 +10,7 @@ import re
 import base64
 import json
 import hashlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime, timezone, timedelta
 from typing import Annotated, Optional, Union, List, Any
 
@@ -606,6 +606,45 @@ AXURE_FOCUS_MAX_CANDIDATES = 8
 
 # 调试模式
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+
+def _safe_identifier(value: str) -> str:
+    """Keep untrusted project/document IDs out of filesystem paths."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
+        raise ValueError("Invalid Lanhu identifier")
+    return value
+
+
+def _safe_resource_path(root: Path, relative_path: str) -> Path:
+    """Reject absolute paths, traversal, and symlinks escaping a cache root."""
+    if not isinstance(relative_path, str) or not relative_path or "\\" in relative_path or ":" in relative_path:
+        raise ValueError("Invalid resource path")
+    relative = PurePosixPath(relative_path)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise ValueError("Resource path must stay inside its cache directory")
+    base = Path(root).resolve()
+    target = (base / relative_path).resolve()
+    if target == base or not target.is_relative_to(base):
+        raise ValueError("Resource path escapes its cache directory")
+    return target
+
+
+async def _scope_lanhu_request(request: httpx.Request) -> None:
+    """Validate every request/redirect and attach credentials only to their origin."""
+    host = request.url.host
+    allowed = host == "lanhuapp.com" or host.endswith(".lanhuapp.com") or host in {
+        "lanhu.oss-cn-beijing.aliyuncs.com", "lanhu-dds-backend.oss-cn-beijing.aliyuncs.com",
+    }
+    if request.url.scheme != "https" or not allowed or request.url.port not in (None, 443) or request.url.userinfo:
+        raise ValueError("Resource URL must use an approved HTTPS Lanhu origin")
+    request.headers.pop("Cookie", None)
+    request.headers.pop("Authorization", None)
+    if host == "lanhuapp.com":
+        request.headers["Cookie"] = COOKIE
+    elif host == "dds.lanhuapp.com":
+        request.headers["Cookie"] = DDS_COOKIE
+        request.headers["Authorization"] = "Basic dW5kZWZpbmVkOg=="
+
 
 # 角色枚举（用于识别用户身份）
 VALID_ROLES = ["后端", "前端", "客户端", "开发", "运维", "产品", "项目经理"]
@@ -2526,12 +2565,12 @@ class MessageStore:
         Args:
             project_id: 项目ID，如果为None则用于全局操作模式
         """
-        self.project_id = project_id
+        self.project_id = _safe_identifier(project_id) if project_id is not None else None
         self.storage_dir = DATA_DIR / "messages"
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
         if project_id:
-            self.file_path = self.storage_dir / f"{project_id}.json"
+            self.file_path = _safe_resource_path(self.storage_dir, f"{self.project_id}.json")
             self._data = self._load()
         else:
             # 全局模式，不加载单个文件
@@ -3028,14 +3067,16 @@ class LanhuExtractor:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Referer": "https://lanhuapp.com/web/",
             "Accept": "application/json, text/plain, */*",
-            "Cookie": COOKIE,
             "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
             "request-from": "web",
             "real-path": "/item/project/product"
         }
-        self.client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers, follow_redirects=True)
+        self.client = httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT, headers=headers, follow_redirects=True,
+            event_hooks={"request": [_scope_lanhu_request]},
+        )
 
     def parse_url(self, url: str) -> dict:
         """
@@ -3089,6 +3130,10 @@ class LanhuExtractor:
         # 验证必需参数（pid 是唯一必需的，tid 可选 — detailDetach 等格式不含 tid）
         if not project_id:
             raise ValueError(f"URL parsing failed: missing required param pid (project_id)")
+
+        _safe_identifier(project_id)
+        if doc_id is not None:
+            _safe_identifier(doc_id)
 
         return {
             'team_id': team_id,
@@ -3337,7 +3382,7 @@ class LanhuExtractor:
         }
 
         for rel_path, expected_md5 in expected_files.items():
-            file_path = output_dir / rel_path
+            file_path = _safe_resource_path(output_dir, rel_path)
 
             if not file_path.exists():
                 result['missing'].append(rel_path)
@@ -3622,6 +3667,7 @@ class LanhuExtractor:
         downloaded_files = []
 
         for html_filename, page_info in pages.items():
+            html_path = _safe_resource_path(output_path, html_filename)
             html_data = page_info.get('html', {})
             html_file_with_md5 = html_data.get('sign_md5', '')
             page_mapping_md5 = page_info.get('mapping_md5', '')
@@ -3649,7 +3695,7 @@ class LanhuExtractor:
                 is_first_page = False
 
             # 保存HTML
-            html_path = output_path / html_filename
+            html_path.parent.mkdir(parents=True, exist_ok=True)
             html_path.write_text(html_content, encoding='utf-8')
             downloaded_files.append(html_filename)
 
@@ -3683,7 +3729,7 @@ class LanhuExtractor:
             sign_md5 = info.get('sign_md5', '')
             if sign_md5:
                 url = sign_md5 if sign_md5.startswith('http') else f"{CDN_URL}/{sign_md5}"
-                tasks.append(self._download_file(url, output_dir / local_path))
+                tasks.append((url, _safe_resource_path(output_dir, local_path)))
 
         # 下载JS
         for local_path, info in page_mapping.get('scripts', {}).items():
@@ -3692,27 +3738,24 @@ class LanhuExtractor:
             sign_md5 = info.get('sign_md5', '')
             if sign_md5:
                 url = sign_md5 if sign_md5.startswith('http') else f"{CDN_URL}/{sign_md5}"
-                tasks.append(self._download_file(url, output_dir / local_path))
+                tasks.append((url, _safe_resource_path(output_dir, local_path)))
 
         # 下载图片
         for local_path, info in page_mapping.get('images', {}).items():
             sign_md5 = info.get('sign_md5', '')
             if sign_md5:
                 url = sign_md5 if sign_md5.startswith('http') else f"{CDN_URL}/{sign_md5}"
-                tasks.append(self._download_file(url, output_dir / local_path))
+                tasks.append((url, _safe_resource_path(output_dir, local_path)))
 
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*(self._download_file(url, path) for url, path in tasks))
 
     async def _download_file(self, url: str, local_path: Path):
         """下载单个文件"""
-        try:
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            response = await self.client.get(url)
-            response.raise_for_status()
-            local_path.write_bytes(response.content)
-        except Exception:
-            pass
+        response = await self.client.get(url)
+        response.raise_for_status()
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(response.content)
 
     @staticmethod
     def _build_scale_urls(image_url: str, logical_w: float, logical_h: float, slice_scale: int) -> dict:
@@ -4246,10 +4289,11 @@ class LanhuExtractor:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://dds.lanhuapp.com/",
-            "Cookie": DDS_COOKIE,
-            "Authorization": "Basic dW5kZWZpbmVkOg==",
         }
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=dds_headers, follow_redirects=True) as dds_client:
+        async with httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT, headers=dds_headers, follow_redirects=True,
+            event_hooks={"request": [_scope_lanhu_request]},
+        ) as dds_client:
             rev_url = f"{DDS_BASE_URL}/api/dds/image/store_schema_revise"
             rev_resp = await dds_client.get(rev_url, params={"version_id": version_id})
             rev_resp.raise_for_status()
@@ -8338,7 +8382,7 @@ def main():
     parser = argparse.ArgumentParser(description="Lanhu MCP: versioned design context and asset delivery")
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--transport", choices=("http", "stdio"), default=os.getenv("MCP_TRANSPORT", "http").lower())
-    parser.add_argument("--host", default=os.getenv("SERVER_HOST", "0.0.0.0"))
+    parser.add_argument("--host", default=os.getenv("SERVER_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("SERVER_PORT", "8000")))
     args = parser.parse_args()
     # 运行MCP服务器
